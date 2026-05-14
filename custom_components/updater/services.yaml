@@ -1,0 +1,17 @@
+install_desired_release:
+  name: Install desired release
+  description: Backup Home Assistant, deploy desired release zip, and restart.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Optional updater config entry ID.
+      example: 0123456789abcdef0123456789abcdef
+
+restore_last_backup:
+  name: Restore last backup
+  description: Restore last updater backup and restart Home Assistant.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Optional updater config entry ID.
+      example: 0123456789abcdef0123456789abcdef

@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Updater",
+        "description": "Connect Home Assistant to your updater server.",
+        "data": {
+          "server_url": "Server URL (without /api)",
+          "customer_id": "Customer ID",
+          "api_token": "Customer API Token",
+          "device_name": "Device name",
+          "channel": "Channel",
+          "scan_interval": "Check interval (seconds)"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Updater options",
+        "data": {
+          "server_url": "Server URL (without /api)",
+          "customer_id": "Customer ID",
+          "api_token": "Customer API Token",
+          "device_name": "Device name",
+          "channel": "Channel",
+          "scan_interval": "Check interval (seconds)"
+        }
+      }
+    }
+  }
+}
