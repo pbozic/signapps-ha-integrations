@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import shutil
 import zipfile
 import logging
@@ -14,6 +15,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import UpdaterApi
+from .const import FRONTEND_MODULE_URL_SUBSTRINGS
 
 _LOGGER = logging.getLogger(__name__)
 _MANAGED_LOVELACE_START = "# BEGIN updater-managed-lovelace"
@@ -192,6 +194,229 @@ def _collect_card_resource_urls(config_dir: Path) -> list[str]:
     return sorted(set(urls))
 
 
+def _load_lovelace_resources_from_storage(config_dir: Path) -> list[tuple[str, str]]:
+    """URLs and types from UI storage (e.g. HACS). Preserved when switching to YAML Lovelace."""
+    path = config_dir / ".storage" / "lovelace_resources"
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, TypeError):
+        return []
+
+    data = raw.get("data") if isinstance(raw, dict) else None
+    if not isinstance(data, dict):
+        data = raw if isinstance(raw, dict) else {}
+
+    items = data.get("items")
+    if not isinstance(items, list):
+        return []
+
+    out: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        rtype = item.get("type")
+        if not isinstance(rtype, str) or rtype not in ("module", "js", "css"):
+            rtype = "module"
+        out.append((url.strip(), rtype))
+    return out
+
+
+def _parse_resource_entries_from_managed_block(text: str) -> list[tuple[str, str]]:
+    """Extract url + type from a previous updater-managed lovelace block."""
+    if _MANAGED_LOVELACE_START not in text or _MANAGED_LOVELACE_END not in text:
+        return []
+    try:
+        start = text.index(_MANAGED_LOVELACE_START)
+        end = text.index(_MANAGED_LOVELACE_END)
+    except ValueError:
+        return []
+    chunk = text[start:end]
+    entries: list[tuple[str, str]] = []
+    lines = chunk.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*-\s*url:\s*(.+)\s*$", line)
+        if not m:
+            continue
+        url = m.group(1).strip().strip("\"'")
+        if not url:
+            continue
+        rtype = "module"
+        if i + 1 < len(lines):
+            tm = re.match(r"^\s*type:\s*(\S+)", lines[i + 1])
+            if tm:
+                candidate = tm.group(1).strip().strip("\"'")
+                if candidate in ("module", "js", "css"):
+                    rtype = candidate
+        entries.append((url, rtype))
+    return entries
+
+
+def _merge_lovelace_resource_urls(
+    config_dir: Path,
+    *,
+    existing_configuration_text: str,
+    signapps_urls: list[str],
+) -> list[tuple[str, str]]:
+    """Union SignApps, HACS/UI storage, and prior managed block. Per-url type prefers storage."""
+    by_url: dict[str, str] = {}
+    for url in signapps_urls:
+        u = url.strip()
+        if u:
+            by_url.setdefault(u, "module")
+    for url, rtype in _parse_resource_entries_from_managed_block(existing_configuration_text):
+        by_url.setdefault(url, rtype)
+    for url, rtype in _load_lovelace_resources_from_storage(config_dir):
+        by_url[url] = rtype
+    return sorted(by_url.items(), key=lambda x: x[0])
+
+
+def _url_prefers_frontend_module(url: str, rtype: str) -> bool:
+    """True if this resource should load via frontend.extra_module_url (not Lovelace resources)."""
+    if rtype == "css":
+        return False
+    low = url.lower()
+    return any(s in low for s in FRONTEND_MODULE_URL_SUBSTRINGS)
+
+
+def _partition_lovelace_and_frontend_module_urls(
+    merged: list[tuple[str, str]],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Split merged resources: frontend-module URLs vs Lovelace-only (avoid double-loading)."""
+    lovelace: list[tuple[str, str]] = []
+    frontend: list[str] = []
+    seen_fe: set[str] = set()
+    for url, rtype in merged:
+        if _url_prefers_frontend_module(url, rtype):
+            if url not in seen_fe:
+                seen_fe.add(url)
+                frontend.append(url)
+        else:
+            lovelace.append((url, rtype))
+    return lovelace, frontend
+
+
+def _is_root_level_yaml_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    return not line.startswith(" ") and not line.startswith("\t")
+
+
+def _parse_yaml_list_item_scalar(line: str) -> str | None:
+    m = re.match(r"^\s*-\s+(.+?)\s*$", line)
+    if not m:
+        return None
+    val = m.group(1).strip()
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        val = val[1:-1]
+    return val or None
+
+
+def _merge_frontend_extra_module_urls(config_text: str, urls_to_add: list[str]) -> str:
+    """Merge URLs into root `frontend.extra_module_url` without touching other keys (line-based).
+
+    HACS only registers plugins in ``.storage/lovelace_resources``; it does not write
+    ``frontend.extra_module_url``. We mirror matching URLs here so card-mod-style modules
+    load globally like a manual HA config.
+    """
+    if not urls_to_add:
+        return config_text
+
+    newline = "\r\n" if "\r\n" in config_text else "\n"
+    lines = config_text.splitlines()
+
+    def join_body(body: list[str]) -> str:
+        if not body:
+            return ""
+        out = newline.join(body)
+        if config_text.endswith(newline) or (config_text and config_text[-1] in "\n\r"):
+            return out + newline
+        return out
+
+    try:
+        fe_idx: int | None = None
+        for i, line in enumerate(lines):
+            if _is_root_level_yaml_line(line) and re.match(r"^frontend:\s*", line.strip()):
+                fe_idx = i
+                break
+
+        to_merge = list(urls_to_add)
+        if fe_idx is None:
+            tail = [
+                "",
+                "# SignApps updater: frontend modules (e.g. card-mod) merged from Lovelace resources.",
+                "frontend:",
+                "  extra_module_url:",
+            ]
+            for u in to_merge:
+                tail.append(f"    - {u}")
+            return join_body(lines + tail)
+
+        block_end = len(lines)
+        for j in range(fe_idx + 1, len(lines)):
+            if _is_root_level_yaml_line(lines[j]):
+                block_end = j
+                break
+
+        em_line: int | None = None
+        em_indent = 0
+        for j in range(fe_idx + 1, block_end):
+            m = re.match(r"^(\s*)extra_module_url:\s*$", lines[j])
+            if m:
+                em_line = j
+                em_indent = len(m.group(1))
+                break
+
+        if em_line is None:
+            insert: list[str] = [
+                "  extra_module_url:",
+            ]
+            for u in to_merge:
+                insert.append(f"    - {u}")
+            new_lines = lines[: fe_idx + 1] + insert + lines[fe_idx + 1 :]
+            return join_body(new_lines)
+
+        existing: list[str] = []
+        k = em_line + 1
+        while k < block_end:
+            raw = lines[k]
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                k += 1
+                continue
+            indent = len(raw) - len(raw.lstrip())
+            if indent <= em_indent:
+                break
+            item = _parse_yaml_list_item_scalar(raw)
+            if item is not None:
+                existing.append(item)
+            k += 1
+
+        merged_list: list[str] = []
+        seen: set[str] = set()
+        for u in existing + to_merge:
+            u = u.strip()
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            merged_list.append(u)
+
+        pad = " " * (em_indent + 2)
+        new_block_lines = [lines[em_line]]
+        for u in merged_list:
+            new_block_lines.append(f"{pad}- {u}")
+
+        new_lines = lines[:em_line] + new_block_lines + lines[k:]
+        return join_body(new_lines)
+    except Exception as err:
+        _LOGGER.warning("Could not merge frontend.extra_module_url: %s", err)
+        return config_text
+
+
 def _write_generated_dashboard(config_dir: Path, customer_key: str, composed: dict[str, Any]) -> Path:
     generated_dir = config_dir / "dashboard" / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
@@ -219,10 +444,19 @@ def _ensure_lovelace_dashboard_wiring(
     if config_file.exists():
         existing = config_file.read_text(encoding="utf-8")
 
+    merged_resources = _merge_lovelace_resource_urls(
+        config_dir,
+        existing_configuration_text=existing,
+        signapps_urls=resources,
+    )
+    lovelace_resources, frontend_module_urls = _partition_lovelace_and_frontend_module_urls(
+        merged_resources
+    )
+
     resources_block = ""
-    if resources:
+    if lovelace_resources:
         resources_block = "  resources:\n" + "".join(
-            f"    - url: {url}\n      type: module\n" for url in resources
+            f"    - url: {url}\n      type: {rtype}\n" for url, rtype in lovelace_resources
         )
 
     managed_block = (
@@ -248,6 +482,13 @@ def _ensure_lovelace_dashboard_wiring(
         updated = re.sub(pattern, managed_block, existing)
     else:
         updated = existing.rstrip() + "\n\n" + managed_block
+
+    if frontend_module_urls:
+        updated = _merge_frontend_extra_module_urls(updated, frontend_module_urls)
+        _LOGGER.info(
+            "Merged %d URL(s) into frontend.extra_module_url (not duplicated in Lovelace resources)",
+            len(frontend_module_urls),
+        )
 
     config_file.write_text(updated, encoding="utf-8")
 

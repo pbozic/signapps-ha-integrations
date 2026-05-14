@@ -1,175 +1,98 @@
-# Updater Home Assistant Integration
+# SignApps Updater (Home Assistant)
 
-This integration connects Home Assistant to the deployment server in this repository.
+Custom integration that connects Home Assistant to your **SignApps** (or compatible) deployment server: device registration, release checks, optional automatic installs, and optional Cloudflare tunnel credential delivery for the companion **SignApps Tunnel** add-on.
 
-## What it does
+## Features
 
-- Registers the current Home Assistant instance as a device for a specific customer.
-- Stores the issued `device_id` + device token locally after first registration.
-- Periodically checks `/api/devices/{device_id}/desired-release`.
-- Sends `/api/devices/{device_id}/checkin` each poll.
-- Automatically installs a newer desired release when detected.
-- After each poll, fetches **`GET /api/devices/{device_id}/tunnel-credentials`** (device bearer) when the backend has provisioned a Cloudflare tunnel, and writes **`/config/signapps_tunnel/credentials.json`** for the **SignApps Tunnel** add-on (see `addons/signapps-tunnel/README.md` and `ha-cloudflare-plan.md` §19).
-- Exposes entities:
-  - `sensor.installed_version`
-  - `sensor.latest_version`
-  - `sensor.last_check_in`
-  - `binary_sensor.update_available`
+- Registers this Home Assistant instance and stores credentials locally after first setup.
+- Polls the server for the **desired release**, reports version sensors, and sends periodic check-ins.
+- Can **download and apply** a newer release when the server indicates one (with backup and restart flow).
+- When the server has provisioned a tunnel, fetches tunnel credentials and writes **`/config/signapps_tunnel/credentials.json`** for the SignApps Tunnel add-on (no manual tunnel token paste in the add-on).
 
-## Configuration
+**Entities:** `sensor.installed_version`, `sensor.latest_version`, `sensor.last_check_in`, `binary_sensor.update_available`.
 
-Add the integration through the Home Assistant UI and provide:
+## Install
 
-- `server_url` (example: `http://192.168.1.10:3001`)
-- `customer_id` (customer id from backend)
-- `api_token` (customer-scoped API token)
-  - Generate/rotate per customer via: `POST /api/customers/{customer_id}/token/rotate` (admin JWT)
-- `device_name`
-- `channel` (`stable` or `beta`)
-- `scan_interval` in seconds
+Use [HACS](https://hacs.xyz/) (custom repository) or copy this integration into **`custom_components/updater`** under your Home Assistant configuration directory, then restart Home Assistant.
 
-### Local values file on HA
+## Configuration (UI)
 
-You can override these values from a file on Home Assistant itself:
+Add the integration in **Settings → Devices & services → Add integration** and provide the values supplied by your administrator or hosting provider:
 
-- `/config/updater.values.json`
+| Field | Description |
+|--------|-------------|
+| **Server URL** | Base URL of the deployment API (HTTPS recommended). |
+| **Customer ID** | Identifies your account/tenant on the server. |
+| **API token** | Customer-scoped token used for registration and updates. |
+| **Device name** | Friendly label for this Home Assistant instance. |
+| **Channel** | Release channel, e.g. `stable` or `beta`. |
+| **Scan interval** | Seconds between polls. |
 
-Example:
+## Optional local overrides
+
+If **`/config/updater.values.json`** exists, its keys override the UI-configured values at startup (same field names as above). Use only on trusted hosts; the file can contain secrets.
 
 ```json
 {
-  "server_url": "http://192.168.1.10:3001",
-  "customer_id": "cmabcd1234",
-  "api_token": "customer-token-here",
-  "device_name": "HA Main",
+  "server_url": "https://your-server.example",
+  "customer_id": "YOUR_CUSTOMER_ID",
+  "api_token": "YOUR_TOKEN",
+  "device_name": "Home",
   "channel": "stable",
   "scan_interval": 300
 }
 ```
 
-If present, this file overrides the UI-configured values at startup.
+## Services
 
-## Folder placement
+- **`updater.install_desired_release`** — Creates a backup, downloads the current desired release package, deploys configured paths, and requests a Home Assistant restart. Normally runs automatically when a newer desired release is detected; can be triggered manually. Optional `entry_id` if you have multiple config entries.
+- **`updater.restore_last_backup`** — Restores the last backup created by the updater install flow and requests a restart. Optional `entry_id`.
 
-This repo stores the source in:
+## Release package layout (advanced)
 
-`integrations/updater`
-
-For Home Assistant loading, copy it to:
-
-`<config>/custom_components/updater`
-
-**Platform release zips** (from `npm run release:prepare`) only ship `packages/`, `dashboard/`, and `www/`. They do **not** replace this Python integration. Whenever you change code under `integrations/updater/` (for example `installer.py`), copy the whole folder to `custom_components/updater` again and restart Home Assistant, or the instance will keep running the old logic.
-
-The structure is based on the Home Assistant integration creation docs:
-[Creating your first integration](https://developers.home-assistant.io/docs/creating_component_index/).
-
-## Runtime flow
-
-1. User configures integration in Home Assistant with:
-   - server URL
-   - customer ID
-   - customer API token
-2. Integration loads stored `device_id` + device token from HA storage.
-3. If missing, integration registers the device:
-   - `POST /api/devices` with customer token
-   - stores returned `device_id` + device token
-4. On each poll interval:
-   - `GET /api/devices/{device_id}/desired-release`
-   - compare desired version vs installed version
-   - `POST /api/devices/{device_id}/checkin` with status
-   - if desired version is newer: install release + compose/apply dashboard wiring
-5. Coordinator updates entities:
-   - installed version
-   - latest version
-   - update available
-   - last check-in timestamp
-
-## Release zip structure
-
-Release artifacts are expected to be zip files with this structure (aligned with `ha-plan.md`):
+The server serves versioned **zip** artifacts. Typical content:
 
 ```text
 packages/
 dashboard/
 www/
-release-manifest.json (optional, bootstrap-only)
+release-manifest.json   (optional; used only on first bootstrap)
 ```
 
-Deploy mapping:
+Typical deploy mapping on the Home Assistant host:
 
-- `packages/**` -> `/config/packages/**`
-- `dashboard/**` -> `/config/dashboard/**`
-- `www/**` -> `/config/www/**`
-- `release-manifest.json` -> `/config/updater/state/release-manifest.json` (first install only, never overwritten)
+- `packages/**` → `/config/packages/**`
+- `dashboard/**` → `/config/dashboard/**`
+- `www/**` → `/config/www/**`
+- `release-manifest.json` → `/config/updater/state/release-manifest.json` (first install only)
 
-For custom cards, release assets should live under:
+Custom frontend assets often live under `www/` and are unpacked into matching paths under `/config/www/`.
 
-- `www/ha-signapps-cards/**` -> `/config/www/ha-signapps-cards/**`
+## Dashboard preset model (advanced)
 
-## Update and rollback services
+Dashboard YAML is composed from a **preset** plus an optional **per-customer** override; output is written under `/config/dashboard/generated/`. The server’s desired-release metadata selects preset and customer keys and the Lovelace dashboard slug.
 
-This integration registers two Home Assistant services:
+**Customer override file** (strict schema; unknown keys are rejected):
 
-- `updater.install_desired_release`
-  - creates HA backup
-  - downloads + extracts release zip
-  - deploys mapped directories
-  - requests HA restart
-  - can be called manually, but normal operation auto-installs when a newer desired release appears
-- `updater.restore_last_backup`
-  - restores the last updater-created backup
-  - requests HA restart
+- `title` — optional dashboard title override  
+- `hide_views` — optional list of view `path` strings to remove from the preset  
+- `view_overrides` — optional map keyed by view path: `title`, `cards`, `cards_append`  
+- `views_append` — optional list of full view objects to append (`views` is a legacy alias)
 
-Both services accept optional `entry_id` to target a specific updater config entry.
+The integration may inject a managed Lovelace block in **`configuration.yaml`** between `# BEGIN updater-managed-lovelace` and `# END updater-managed-lovelace`. If dashboard application fails, the previous generated file is kept and the install surfaces an error.
 
-## Dashboard preset + customer override model
+**Resources:** The block uses YAML-mode `lovelace:` with a top-level `resources:` list. The updater **merges** (de-duplicated by URL):
 
-Dashboard wiring is YAML-managed and applied by updater during install.
+1. Entry scripts under `/config/www/ha-signapps-cards/**/*.js` (SignApps cards)  
+2. URLs still present in **`/.storage/lovelace_resources`** (typical HACS registrations), preserving each entry’s **`type`** (`module` / `js` / `css`)  
+3. URLs already listed in the **previous** managed block (so re-runs do not shrink the list)
 
-Source files copied by release:
+HACS registers plugins in **`.storage/lovelace_resources`** only; it does **not** append **`frontend.extra_module_url`**. For URLs that must load as global frontend modules, the updater reads the same merged list: any URL whose path matches **`FRONTEND_MODULE_URL_SUBSTRINGS`** in **`const.py`** (default: **`lovelace-card-mod`** for [card-mod](https://github.com/thomasloven/lovelace-card-mod)) is merged into root **`frontend.extra_module_url`** in `configuration.yaml` and is **not** repeated under Lovelace **`resources:`**, so the module is not loaded twice. Add substrings for other HACS plugins that need the same behavior. Non-HACS URLs still require a manual **`frontend:`** block.
 
-- `/config/dashboard/presets/<preset_key>.yaml` (base preset)
-- `/config/dashboard/customers/<customer_key>.yaml` (customer override, optional)
+If HACS entries were already lost from `.storage` before the next updater run, restore them once from a backup or re-add via HACS; subsequent installs will keep them in `configuration.yaml`.
 
-Generated output:
+Restart Home Assistant after an install that changed `configuration.yaml`.
 
-- `/config/dashboard/generated/<customer_key>.yaml`
+---
 
-Desired release metadata should include:
-
-- `preset_key` (default: `default`)
-- `customer_key` (usually backend customer id)
-- `dashboard_slug` (Lovelace dashboard key; must contain `-` in the final value — the updater enforces this for Home Assistant)
-
-### Customer override schema (strict)
-
-Allowed keys in customer file:
-
-- `title`: optional string, overrides dashboard title
-- `hide_views`: optional list of view `path` strings to remove from preset
-- `view_overrides`: optional object keyed by view path with:
-  - `title`: optional string
-  - `cards`: optional list (replace cards)
-  - `cards_append`: optional list (append cards)
-- `views_append`: optional list of full view objects to append
-- `views`: legacy alias for `views_append`
-
-Unknown keys are rejected.
-
-### Lovelace wiring
-
-Updater writes a managed Lovelace block in `/config/configuration.yaml` between markers:
-
-- `# BEGIN updater-managed-lovelace`
-- `# END updater-managed-lovelace`
-
-If reload services are available, updater calls Lovelace reload; otherwise it relies on the restart already requested by install flow.
-
-### Failure behavior
-
-If dashboard compose/wiring fails:
-
-- previously generated dashboard file is preserved
-- updater sets `last_update_status = dashboard_apply_failed`
-- install call fails with a detailed error
+Structure follows Home Assistant’s integration guidelines: [Creating your first integration](https://developers.home-assistant.io/docs/creating_component_index/).
