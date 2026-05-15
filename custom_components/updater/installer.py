@@ -318,15 +318,18 @@ def _ensure_panel_custom_wiring(
             config_file.write_text(re.sub(pattern, "", existing).rstrip() + "\n", encoding="utf-8")
         return
 
+    # HA panel_custom expects a list (name, sidebar_title, sidebar_icon, …), not a dict keyed by slug.
+    safe_title = json.dumps(panel_title)
     managed_block = (
         f"{_MANAGED_PANEL_START}\n"
         "panel_custom:\n"
-        "  signapps-react:\n"
-        f"    title: {panel_title}\n"
-        "    icon: mdi:view-dashboard-variant\n"
+        "  - name: signapps-react\n"
+        f"    sidebar_title: {safe_title}\n"
+        "    sidebar_icon: mdi:view-dashboard-variant\n"
         "    url_path: signapps\n"
         "    module_url: /local/signapps-dashboard/signapps-panel.js\n"
         "    require_admin: false\n"
+        "    embed_iframe: true\n"
         f"{_MANAGED_PANEL_END}\n"
     )
 
