@@ -298,51 +298,43 @@ def _sync_react_config_to_www(config_dir: Path, composed: dict[str, Any]) -> Pat
     return out_path
 
 
-def _ensure_panel_custom_wiring(
-    config_dir: Path,
-    *,
-    panel_title: str,
-    panel_enabled: bool,
-) -> None:
+def _remove_signapps_panel_custom_yaml(config_dir: Path) -> bool:
+    """Strip SignApps panel_custom from configuration.yaml (panel is registered by the updater integration)."""
     config_file = config_dir / "configuration.yaml"
-    existing = ""
-    if config_file.exists():
-        existing = config_file.read_text(encoding="utf-8")
+    if not config_file.exists():
+        return False
 
-    if not panel_enabled:
-        if _MANAGED_PANEL_START in existing and _MANAGED_PANEL_END in existing:
-            pattern = re.compile(
-                rf"{re.escape(_MANAGED_PANEL_START)}.*?{re.escape(_MANAGED_PANEL_END)}\n?",
-                flags=re.DOTALL,
-            )
-            config_file.write_text(re.sub(pattern, "", existing).rstrip() + "\n", encoding="utf-8")
-        return
+    existing = config_file.read_text(encoding="utf-8")
+    updated = existing
 
-    # HA panel_custom expects a list (name, sidebar_title, sidebar_icon, …), not a dict keyed by slug.
-    safe_title = json.dumps(panel_title)
-    managed_block = (
-        f"{_MANAGED_PANEL_START}\n"
-        "panel_custom:\n"
-        "  - name: signapps-react\n"
-        f"    sidebar_title: {safe_title}\n"
-        "    sidebar_icon: mdi:view-dashboard-variant\n"
-        "    url_path: signapps\n"
-        "    module_url: /local/signapps-dashboard/signapps-panel.js\n"
-        "    require_admin: false\n"
-        "    embed_iframe: true\n"
-        f"{_MANAGED_PANEL_END}\n"
-    )
-
-    if _MANAGED_PANEL_START in existing and _MANAGED_PANEL_END in existing:
-        pattern = re.compile(
+    if _MANAGED_PANEL_START in updated and _MANAGED_PANEL_END in updated:
+        managed_pattern = re.compile(
             rf"{re.escape(_MANAGED_PANEL_START)}.*?{re.escape(_MANAGED_PANEL_END)}\n?",
             flags=re.DOTALL,
         )
-        updated = re.sub(pattern, managed_block, existing)
-    else:
-        updated = existing.rstrip() + "\n\n" + managed_block
+        updated = managed_pattern.sub("", updated)
+
+    legacy_patterns = [
+        # Dict style (invalid): panel_custom:\n  signapps-react:\n    title: ...
+        r"panel_custom:\s*\n\s+signapps-react:\s*\n(?:[ \t]+.+\n)*",
+        # Malformed list (invalid): panel_custom:\n  - signapps-react:\n    title: ...
+        r"panel_custom:\s*\n\s+-\s+signapps-react:\s*\n(?:[ \t]+.+\n)*",
+        # Valid list style we previously wrote — remove so YAML is not duplicated
+        r"panel_custom:\s*\n\s+-\s+name:\s+signapps-react\s*\n(?:[ \t]+.+\n)*",
+    ]
+    for pattern in legacy_patterns:
+        updated = re.sub(pattern, "", updated, flags=re.MULTILINE)
+
+    updated = re.sub(r"\n{3,}", "\n\n", updated).rstrip() + "\n"
+    if updated == existing:
+        return False
 
     config_file.write_text(updated, encoding="utf-8")
+    _LOGGER.info(
+        "Removed panel_custom SignApps block from configuration.yaml "
+        "(updater registers the panel at runtime)"
+    )
+    return True
 
 
 def _safe_dashboard_slug(value: str) -> str:
@@ -816,15 +808,12 @@ async def install_desired_release(
             react_composed,
         )
         await hass.async_add_executor_job(_sync_react_config_to_www, config_dir, react_composed)
-        react_title = str(react_composed.get("title") or dashboard_title)
         react_enabled = bool(react_composed.get("enabled"))
-        await hass.async_add_executor_job(
-            lambda: _ensure_panel_custom_wiring(
-                config_dir,
-                panel_title=react_title,
-                panel_enabled=react_enabled,
-            )
-        )
+        await hass.async_add_executor_job(_remove_signapps_panel_custom_yaml, config_dir)
+        if react_enabled:
+            from .panel import async_setup_signapps_panel
+
+            await async_setup_signapps_panel(hass)
         _LOGGER.info(
             "Dashboard wiring applied: generated=%s slug=%s react=%s enabled=%s",
             generated_path,

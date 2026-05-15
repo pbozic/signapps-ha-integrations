@@ -43,6 +43,7 @@ from .const import (
 )
 from .coordinator import UpdaterCoordinator
 from .installer import install_desired_release, restore_last_backup
+from .panel import async_setup_signapps_panel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -226,6 +227,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    try:
+        await async_setup_signapps_panel(hass)
+    except Exception as err:
+        _LOGGER.warning("SignApps panel registration skipped: %s", err)
+
     return True
 
 
