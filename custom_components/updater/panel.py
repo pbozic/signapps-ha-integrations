@@ -6,13 +6,15 @@ from pathlib import Path
 
 from homeassistant.core import HomeAssistant
 
+from .const import INTEGRATION_VERSION
+
 _LOGGER = logging.getLogger(__name__)
 
 PANEL_HASS_DATA_KEY = "updater_signapps_panel_registered"
 
 PANEL_COMPONENT_NAME = "signapps-react"
 PANEL_URL_PATH = "signapps"
-PANEL_MODULE_URL = "/local/signapps-dashboard/signapps-panel.js"
+PANEL_MODULE_URL = f"/local/signapps-dashboard/signapps-panel.js?v={INTEGRATION_VERSION}"
 PANEL_ICON = "mdi:view-dashboard-variant"
 
 
