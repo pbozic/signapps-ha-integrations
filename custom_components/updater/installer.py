@@ -20,6 +20,8 @@ from .const import FRONTEND_MODULE_URL_SUBSTRINGS
 _LOGGER = logging.getLogger(__name__)
 _MANAGED_LOVELACE_START = "# BEGIN updater-managed-lovelace"
 _MANAGED_LOVELACE_END = "# END updater-managed-lovelace"
+_MANAGED_PANEL_START = "# BEGIN updater-managed-panel"
+_MANAGED_PANEL_END = "# END updater-managed-panel"
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
@@ -99,7 +101,7 @@ def _compose_dashboard_config(
     if not isinstance(customer_raw, dict):
         raise RuntimeError("Customer dashboard override must be a YAML object")
 
-    allowed_keys = {"title", "hide_views", "views_append", "view_overrides", "views"}
+    allowed_keys = {"title", "hide_views", "views_append", "view_overrides", "views", "react"}
     unknown_keys = set(customer_raw.keys()) - allowed_keys
     if unknown_keys:
         raise RuntimeError(f"Unsupported customer override keys: {', '.join(sorted(unknown_keys))}")
@@ -162,7 +164,182 @@ def _compose_dashboard_config(
         raise RuntimeError("Composed dashboard has no views")
 
     merged["views"] = views
+    merged.pop("react", None)
     return merged
+
+
+def _validate_react_view(view: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(view, dict):
+        raise RuntimeError(f"{label} react view must be an object")
+    path = view.get("path")
+    title = view.get("title")
+    cards = view.get("cards")
+    if not isinstance(path, str) or not path.strip():
+        raise RuntimeError(f"{label} react view.path must be a non-empty string")
+    if not isinstance(title, str) or not title.strip():
+        raise RuntimeError(f"{label} react view.title must be a non-empty string")
+    if not isinstance(cards, list):
+        raise RuntimeError(f"{label} react view.cards must be a list")
+    return dict(view)
+
+
+def _compose_react_dashboard_config(
+    preset_path: Path,
+    customer_path: Path | None,
+) -> dict[str, Any]:
+    preset_raw = _load_yaml(preset_path)
+    preset_react = preset_raw.get("react") if isinstance(preset_raw, dict) else None
+    if not isinstance(preset_react, dict):
+        preset_react = {}
+
+    enabled = bool(preset_react.get("enabled", False))
+    title = str(preset_react.get("title") or "SignApps")
+    views: list[dict[str, Any]] = []
+    if enabled:
+        preset_views = preset_react.get("views")
+        if isinstance(preset_views, list):
+            views = [_validate_react_view(view, label="Preset react") for view in preset_views]
+
+    customer_raw = _load_yaml(customer_path) if customer_path else None
+    if not isinstance(customer_raw, dict):
+        return {"enabled": enabled and bool(views), "title": title, "views": views}
+
+    customer_react = customer_raw.get("react")
+    if not isinstance(customer_react, dict):
+        return {"enabled": enabled and bool(views), "title": title, "views": views}
+
+    if customer_react.get("enabled") is False:
+        return {"enabled": False, "title": title, "views": []}
+
+    if customer_react.get("enabled") is True:
+        enabled = True
+
+    title_override = customer_react.get("title")
+    if isinstance(title_override, str) and title_override.strip():
+        title = title_override.strip()
+
+    view_by_path = {view["path"]: view for view in views}
+
+    hide_views = customer_react.get("hide_views", [])
+    if hide_views:
+        if not isinstance(hide_views, list) or not all(isinstance(v, str) for v in hide_views):
+            raise RuntimeError("Customer react.hide_views must be a string list")
+        hide_set = {v.strip() for v in hide_views if v.strip()}
+        views = [view for view in views if view["path"] not in hide_set]
+        view_by_path = {view["path"]: view for view in views}
+
+    view_overrides = customer_react.get("view_overrides", {})
+    if view_overrides:
+        if not isinstance(view_overrides, dict):
+            raise RuntimeError("Customer react.view_overrides must be an object keyed by view path")
+        for view_path, override in view_overrides.items():
+            if not isinstance(view_path, str) or not view_path.strip():
+                raise RuntimeError("Customer react.view_overrides keys must be non-empty strings")
+            if not isinstance(override, dict):
+                raise RuntimeError(f"Customer react.view_overrides[{view_path}] must be an object")
+            target = view_by_path.get(view_path)
+            if not target:
+                continue
+            if "title" in override:
+                if not isinstance(override["title"], str) or not override["title"].strip():
+                    raise RuntimeError(
+                        f"Customer react.view_overrides[{view_path}].title must be non-empty string"
+                    )
+                target["title"] = override["title"]
+            if "cards" in override:
+                if not isinstance(override["cards"], list):
+                    raise RuntimeError(f"Customer react.view_overrides[{view_path}].cards must be a list")
+                target["cards"] = override["cards"]
+            if "cards_append" in override:
+                if not isinstance(override["cards_append"], list):
+                    raise RuntimeError(
+                        f"Customer react.view_overrides[{view_path}].cards_append must be a list"
+                    )
+                target["cards"] = list(target.get("cards", [])) + override["cards_append"]
+
+    views_append = customer_react.get("views_append")
+    if views_append is None and isinstance(customer_react.get("views"), list):
+        views_append = customer_react.get("views")
+    if views_append:
+        if not isinstance(views_append, list):
+            raise RuntimeError("Customer react.views_append must be a list")
+        for view in views_append:
+            validated = _validate_react_view(view, label="Customer react")
+            views.append(validated)
+        enabled = True
+
+    if views and customer_react.get("enabled") is not False:
+        enabled = True
+
+    return {"enabled": enabled and bool(views), "title": title, "views": views}
+
+
+def _write_generated_react_dashboard(config_dir: Path, customer_key: str, composed: dict[str, Any]) -> Path:
+    generated_dir = config_dir / "dashboard" / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    out_path = generated_dir / f"{customer_key}.react.json"
+    temp_path = generated_dir / f".{customer_key}.react.json.tmp"
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(composed, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+    temp_path.replace(out_path)
+    return out_path
+
+
+def _sync_react_config_to_www(config_dir: Path, composed: dict[str, Any]) -> Path:
+    www_dir = config_dir / "www" / "signapps-dashboard"
+    www_dir.mkdir(parents=True, exist_ok=True)
+    out_path = www_dir / "config.json"
+    temp_path = www_dir / ".config.json.tmp"
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(composed, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+    temp_path.replace(out_path)
+    return out_path
+
+
+def _ensure_panel_custom_wiring(
+    config_dir: Path,
+    *,
+    panel_title: str,
+    panel_enabled: bool,
+) -> None:
+    config_file = config_dir / "configuration.yaml"
+    existing = ""
+    if config_file.exists():
+        existing = config_file.read_text(encoding="utf-8")
+
+    if not panel_enabled:
+        if _MANAGED_PANEL_START in existing and _MANAGED_PANEL_END in existing:
+            pattern = re.compile(
+                rf"{re.escape(_MANAGED_PANEL_START)}.*?{re.escape(_MANAGED_PANEL_END)}\n?",
+                flags=re.DOTALL,
+            )
+            config_file.write_text(re.sub(pattern, "", existing).rstrip() + "\n", encoding="utf-8")
+        return
+
+    managed_block = (
+        f"{_MANAGED_PANEL_START}\n"
+        "panel_custom:\n"
+        "  signapps-react:\n"
+        f"    title: {panel_title}\n"
+        "    icon: mdi:view-dashboard-variant\n"
+        "    url_path: signapps\n"
+        "    module_url: /local/signapps-dashboard/signapps-panel.js\n"
+        "    require_admin: false\n"
+        f"{_MANAGED_PANEL_END}\n"
+    )
+
+    if _MANAGED_PANEL_START in existing and _MANAGED_PANEL_END in existing:
+        pattern = re.compile(
+            rf"{re.escape(_MANAGED_PANEL_START)}.*?{re.escape(_MANAGED_PANEL_END)}\n?",
+            flags=re.DOTALL,
+        )
+        updated = re.sub(pattern, managed_block, existing)
+    else:
+        updated = existing.rstrip() + "\n\n" + managed_block
+
+    config_file.write_text(updated, encoding="utf-8")
 
 
 def _safe_dashboard_slug(value: str) -> str:
@@ -623,7 +800,35 @@ async def install_desired_release(
             )
         )
         await _reload_lovelace_or_fallback(hass)
-        _LOGGER.info("Dashboard wiring applied: generated=%s slug=%s", generated_path, dashboard_slug)
+
+        react_composed = await hass.async_add_executor_job(
+            _compose_react_dashboard_config,
+            preset_path,
+            customer_path,
+        )
+        react_generated_path = await hass.async_add_executor_job(
+            _write_generated_react_dashboard,
+            config_dir,
+            customer_key,
+            react_composed,
+        )
+        await hass.async_add_executor_job(_sync_react_config_to_www, config_dir, react_composed)
+        react_title = str(react_composed.get("title") or dashboard_title)
+        react_enabled = bool(react_composed.get("enabled"))
+        await hass.async_add_executor_job(
+            lambda: _ensure_panel_custom_wiring(
+                config_dir,
+                panel_title=react_title,
+                panel_enabled=react_enabled,
+            )
+        )
+        _LOGGER.info(
+            "Dashboard wiring applied: generated=%s slug=%s react=%s enabled=%s",
+            generated_path,
+            dashboard_slug,
+            react_generated_path,
+            react_enabled,
+        )
     except Exception as err:
         state["last_update_status"] = "dashboard_apply_failed"
         await store.async_save(state)
