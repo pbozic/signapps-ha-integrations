@@ -12,7 +12,7 @@ DEFAULT_CHANNEL = "stable"
 DEFAULT_SCAN_INTERVAL = 300
 LOCAL_VALUES_FILE = "updater.values.json"
 INSTALLATION_STORE_KEY = f"{DOMAIN}_installation"
-INTEGRATION_VERSION = "0.2.1"
+INTEGRATION_VERSION = "0.2.5"
 
 PLATFORMS = ["sensor", "binary_sensor"]
 
