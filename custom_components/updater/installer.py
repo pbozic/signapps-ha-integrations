@@ -810,10 +810,8 @@ async def install_desired_release(
         await hass.async_add_executor_job(_sync_react_config_to_www, config_dir, react_composed)
         react_enabled = bool(react_composed.get("enabled"))
         await hass.async_add_executor_job(_remove_signapps_panel_custom_yaml, config_dir)
-        if react_enabled:
-            from .panel import async_setup_signapps_panel
-
-            await async_setup_signapps_panel(hass)
+        # Panel registers on next HA start (async_setup_entry) to avoid "Overwriting panel"
+        # during install before restart.
         _LOGGER.info(
             "Dashboard wiring applied: generated=%s slug=%s react=%s enabled=%s",
             generated_path,
