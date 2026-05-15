@@ -14,7 +14,7 @@ PANEL_HASS_DATA_KEY = "updater_signapps_panel_registered"
 
 PANEL_COMPONENT_NAME = "signapps-react"
 PANEL_URL_PATH = "signapps"
-PANEL_MODULE_URL = f"/local/signapps-dashboard/signapps-panel.js?v={INTEGRATION_VERSION}"
+PANEL_JS_URL = f"/local/signapps-dashboard/signapps-panel.js?v={INTEGRATION_VERSION}"
 PANEL_ICON = "mdi:view-dashboard-variant"
 
 
@@ -58,10 +58,14 @@ async def async_setup_signapps_panel(hass: HomeAssistant) -> bool:
     title = str(react_config.get("title") or "SignApps")
 
     try:
+        from homeassistant.components import frontend
         from homeassistant.components.panel_custom import async_register_panel
     except ImportError as err:
         _LOGGER.error("panel_custom integration unavailable: %s", err)
         return False
+
+    if frontend.async_panel_exists(hass, PANEL_URL_PATH):
+        frontend.async_remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
 
     try:
         await async_register_panel(
@@ -70,7 +74,7 @@ async def async_setup_signapps_panel(hass: HomeAssistant) -> bool:
             webcomponent_name=PANEL_COMPONENT_NAME,
             sidebar_title=title,
             sidebar_icon=PANEL_ICON,
-            module_url=PANEL_MODULE_URL,
+            js_url=PANEL_JS_URL,
             embed_iframe=True,
             require_admin=False,
         )
