@@ -1,13 +1,13 @@
-# SignApps Updater (Home Assistant)
+# Signapps Updater (Home Assistant)
 
-Custom integration that connects Home Assistant to your **SignApps** (or compatible) deployment server: device registration, release checks, optional automatic installs, and optional Cloudflare tunnel credential delivery for the companion **SignApps Tunnel** add-on.
+Custom integration that connects Home Assistant to your **Signapps** (or compatible) deployment server: device registration, release checks, optional automatic installs, and optional Cloudflare tunnel credential delivery for the companion **Signapps Tunnel** add-on.
 
 ## Features
 
 - Registers this Home Assistant instance and stores credentials locally after first setup.
 - Polls the server for the **desired release**, reports version sensors, and sends periodic check-ins.
 - Can **download and apply** a newer release when the server indicates one (with backup and restart flow).
-- When the server has provisioned a tunnel, fetches tunnel credentials and writes **`/config/signapps_tunnel/credentials.json`** for the SignApps Tunnel add-on (no manual tunnel token paste in the add-on).
+- When the server has provisioned a tunnel, fetches tunnel credentials and writes **`/config/signapps_tunnel/credentials.json`** for the Signapps Tunnel add-on (no manual tunnel token paste in the add-on).
 
 **Entities:** `sensor.installed_version`, `sensor.latest_version`, `sensor.last_check_in`, `binary_sensor.update_available`.
 
@@ -19,14 +19,14 @@ Use [HACS](https://hacs.xyz/) (custom repository) or copy this integration into 
 
 Add the integration in **Settings → Devices & services → Add integration** and provide the values supplied by your administrator or hosting provider:
 
-| Field | Description |
-|--------|-------------|
-| **Server URL** | Base URL of the deployment API (HTTPS recommended). |
-| **Customer ID** | Identifies your account/tenant on the server. |
-| **API token** | Customer-scoped token used for registration and updates. |
-| **Device name** | Friendly label for this Home Assistant instance. |
-| **Channel** | Release channel, e.g. `stable` or `beta`. |
-| **Scan interval** | Seconds between polls. |
+| Field             | Description                                              |
+| ----------------- | -------------------------------------------------------- |
+| **Server URL**    | Base URL of the deployment API (HTTPS recommended).      |
+| **Customer ID**   | Identifies your account/tenant on the server.            |
+| **API token**     | Customer-scoped token used for registration and updates. |
+| **Device name**   | Friendly label for this Home Assistant instance.         |
+| **Channel**       | Release channel, e.g. `stable` or `beta`.                |
+| **Scan interval** | Seconds between polls.                                   |
 
 ## Optional local overrides
 
@@ -74,17 +74,17 @@ Dashboard YAML is composed from a **preset** plus an optional **per-customer** o
 
 **Customer override file** (strict schema; unknown keys are rejected):
 
-- `title` — optional dashboard title override  
-- `hide_views` — optional list of view `path` strings to remove from the preset  
-- `view_overrides` — optional map keyed by view path: `title`, `cards`, `cards_append`  
+- `title` — optional dashboard title override
+- `hide_views` — optional list of view `path` strings to remove from the preset
+- `view_overrides` — optional map keyed by view path: `title`, `cards`, `cards_append`
 - `views_append` — optional list of full view objects to append (`views` is a legacy alias)
 
 The integration may inject a managed Lovelace block in **`configuration.yaml`** between `# BEGIN updater-managed-lovelace` and `# END updater-managed-lovelace`. If dashboard application fails, the previous generated file is kept and the install surfaces an error.
 
 **Resources:** The block uses YAML-mode `lovelace:` with a top-level `resources:` list. The updater **merges** (de-duplicated by URL):
 
-1. Entry scripts under `/config/www/ha-signapps-cards/**/*.js` (SignApps cards)  
-2. URLs still present in **`/.storage/lovelace_resources`** (typical HACS registrations), preserving each entry’s **`type`** (`module` / `js` / `css`)  
+1. Entry scripts under `/config/www/ha-signapps-cards/**/*.js` (Signapps cards)
+2. URLs still present in **`/.storage/lovelace_resources`** (typical HACS registrations), preserving each entry’s **`type`** (`module` / `js` / `css`)
 3. URLs already listed in the **previous** managed block (so re-runs do not shrink the list)
 
 HACS registers plugins in **`.storage/lovelace_resources`** only; it does **not** append **`frontend.extra_module_url`**. For URLs that must load as global frontend modules, the updater reads the same merged list: any URL whose path matches **`FRONTEND_MODULE_URL_SUBSTRINGS`** in **`const.py`** (default: **`lovelace-card-mod`** for [card-mod](https://github.com/thomasloven/lovelace-card-mod)) is merged into root **`frontend.extra_module_url`** in `configuration.yaml` and is **not** repeated under Lovelace **`resources:`**, so the module is not loaded twice. Add substrings for other HACS plugins that need the same behavior. Non-HACS URLs still require a manual **`frontend:`** block.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+import hashlib
 import json
 import shutil
 import zipfile
@@ -46,17 +48,52 @@ def _extract_zip(zip_path: Path, target_dir: Path) -> None:
         archive.extractall(target_dir)
 
 
-def _copy_bootstrap_manifest_if_missing(staging_dir: Path, config_dir: Path) -> None:
-    """Copy release manifest once; do not overwrite existing manifest."""
-    src_manifest = staging_dir / "release-manifest.json"
-    if not src_manifest.exists():
-        return
+def read_module_lock(config_dir: Path) -> dict[str, str]:
+    """Read the device's pinned module versions from updater state."""
+    manifest_path = config_dir / "updater" / "state" / "release-manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    module_lock = payload.get("module_lock")
+    if not isinstance(module_lock, dict):
+        return {}
+    return {
+        str(module_name): str(version)
+        for module_name, version in module_lock.items()
+        if version
+    }
+
+
+def _sync_release_manifest(
+    staging_dir: Path,
+    config_dir: Path,
+    *,
+    module_lock: dict[str, str] | None = None,
+    lock_hash: str | None = None,
+) -> None:
+    """Persist release manifest (including module_lock) after each install."""
     target_dir = config_dir / "updater" / "state"
     target_dir.mkdir(parents=True, exist_ok=True)
-    dst_manifest = target_dir / "release-manifest.json"
-    if dst_manifest.exists():
-        return
-    shutil.copy2(src_manifest, dst_manifest)
+    target_path = target_dir / "release-manifest.json"
+
+    src_manifest = staging_dir / "release-manifest.json"
+    if src_manifest.exists():
+        try:
+            payload = json.loads(src_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    else:
+        payload = {}
+
+    if module_lock:
+        payload["module_lock"] = module_lock
+    if lock_hash:
+        payload["lock_hash"] = lock_hash
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    target_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _validate_dashboard_view(view: Any, *, label: str) -> dict[str, Any]:
@@ -193,7 +230,7 @@ def _compose_react_dashboard_config(
         preset_react = {}
 
     enabled = bool(preset_react.get("enabled", False))
-    title = str(preset_react.get("title") or "SignApps")
+    title = str(preset_react.get("title") or "Signapps")
     views: list[dict[str, Any]] = []
     if enabled:
         preset_views = preset_react.get("views")
@@ -299,7 +336,7 @@ def _sync_react_config_to_www(config_dir: Path, composed: dict[str, Any]) -> Pat
 
 
 def _remove_signapps_panel_custom_yaml(config_dir: Path) -> bool:
-    """Strip SignApps panel_custom from configuration.yaml (panel is registered by the updater integration)."""
+    """Strip Signapps panel_custom from configuration.yaml (panel is registered by the updater integration)."""
     config_file = config_dir / "configuration.yaml"
     if not config_file.exists():
         return False
@@ -331,7 +368,7 @@ def _remove_signapps_panel_custom_yaml(config_dir: Path) -> bool:
 
     config_file.write_text(updated, encoding="utf-8")
     _LOGGER.info(
-        "Removed panel_custom SignApps block from configuration.yaml "
+        "Removed panel_custom Signapps block from configuration.yaml "
         "(updater registers the panel at runtime)"
     )
     return True
@@ -434,7 +471,7 @@ def _merge_lovelace_resource_urls(
     existing_configuration_text: str,
     signapps_urls: list[str],
 ) -> list[tuple[str, str]]:
-    """Union SignApps, HACS/UI storage, and prior managed block. Per-url type prefers storage."""
+    """Union Signapps, HACS/UI storage, and prior managed block. Per-url type prefers storage."""
     by_url: dict[str, str] = {}
     for url in signapps_urls:
         u = url.strip()
@@ -521,7 +558,7 @@ def _merge_frontend_extra_module_urls(config_text: str, urls_to_add: list[str]) 
         if fe_idx is None:
             tail = [
                 "",
-                "# SignApps updater: frontend modules (e.g. card-mod) merged from Lovelace resources.",
+                "# Signapps updater: frontend modules (e.g. card-mod) merged from Lovelace resources.",
                 "frontend:",
                 "  extra_module_url:",
             ]
@@ -728,6 +765,11 @@ async def _restore_backup(hass: HomeAssistant, backup_id: str) -> None:
     raise RuntimeError("No backup restore service found (backup.restore or hassio.restore_full)")
 
 
+def _compute_lock_hash(module_lock: dict[str, str]) -> str:
+    sorted_lock = {key: module_lock[key] for key in sorted(module_lock)}
+    return hashlib.sha256(json.dumps(sorted_lock, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 async def install_desired_release(
     hass: HomeAssistant,
     *,
@@ -737,15 +779,17 @@ async def install_desired_release(
     store: Store[dict[str, Any]],
     entry: ConfigEntry,
 ) -> dict[str, Any]:
-    """Install the currently desired release using backup + staged deploy."""
-    desired = (coordinator.data or {}).get("desired_release") or {}
-    version = desired.get("version")
-    artifact_url = desired.get("artifact_url")
+    """Install the update artifact from the latest check-in response."""
+    data = coordinator.data or {}
+    artifact_url = data.get("artifact_url")
+    module_lock = data.get("module_lock") or {}
+    sha256 = data.get("sha256")
 
-    if not version or not artifact_url:
-        raise RuntimeError("No desired release available")
-    if state.get("installed_version") == version:
-        return {"ok": True, "message": f"Already on version {version}"}
+    if not artifact_url:
+        raise RuntimeError("No update artifact available")
+
+    lock_hash = _compute_lock_hash(module_lock) if module_lock else None
+    version = (lock_hash or "update")[:12]
 
     backup_id = await _create_backup(hass, f"pre-updater-{entry.entry_id}-{version}")
 
@@ -766,12 +810,20 @@ async def install_desired_release(
     await hass.async_add_executor_job(_copy_tree, staging_dir / "packages", config_dir / "packages")
     await hass.async_add_executor_job(_copy_tree, staging_dir / "dashboard", config_dir / "dashboard")
     await hass.async_add_executor_job(_copy_tree, staging_dir / "www", config_dir / "www")
-    await hass.async_add_executor_job(_copy_bootstrap_manifest_if_missing, staging_dir, config_dir)
+    resolved_lock = module_lock if isinstance(module_lock, dict) else None
+    await hass.async_add_executor_job(
+        lambda: _sync_release_manifest(
+            staging_dir,
+            config_dir,
+            module_lock=resolved_lock,
+            lock_hash=lock_hash,
+        ),
+    )
 
     # Dashboard wiring phase: preset base + customer override -> generated dashboard + Lovelace wiring
-    preset_key = str(desired.get("preset_key") or "default")
-    customer_key = str(desired.get("customer_key") or entry.data.get("customer_id") or "default")
-    dashboard_slug = _safe_dashboard_slug(str(desired.get("dashboard_slug") or f"signapps_{customer_key}"))
+    preset_key = "default"
+    customer_key = str(entry.data.get("customer_id") or "default")
+    dashboard_slug = _safe_dashboard_slug(f"signapps_{customer_key}")
     generated_filename = f"dashboard/generated/{customer_key}.yaml"
     try:
         preset_path = config_dir / "dashboard" / "presets" / f"{preset_key}.yaml"
@@ -783,7 +835,7 @@ async def install_desired_release(
             customer_key,
             composed,
         )
-        dashboard_title = str(composed.get("title") or f"SignApps ({customer_key})")
+        dashboard_title = str(composed.get("title") or f"Signapps ({customer_key})")
         resources = await hass.async_add_executor_job(_collect_card_resource_urls, config_dir)
         await hass.async_add_executor_job(
             lambda: _ensure_lovelace_dashboard_wiring(
@@ -827,6 +879,8 @@ async def install_desired_release(
     state["pending_version"] = version
     state["last_backup_id"] = backup_id
     state["last_artifact_url"] = artifact_url
+    if sha256:
+        state["last_artifact_sha256"] = sha256
     state["last_update_status"] = "pending_restart"
     await store.async_save(state)
 

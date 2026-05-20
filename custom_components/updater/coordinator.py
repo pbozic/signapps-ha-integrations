@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from homeassistant.const import __version__ as HA_VERSION
@@ -10,6 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import UpdaterApi
+from .installer import read_module_lock
 from .tunnel_credentials import atomic_write_tunnel_credentials
 
 
@@ -64,7 +66,6 @@ class UpdaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     parts = raw.strip().split()
                     if not parts:
                         continue
-                    # /proc/meminfo values are in kB
                     meminfo[key] = int(parts[0])
             if "MemTotal" in meminfo:
                 mem_total_mb = int(meminfo["MemTotal"] / 1024)
@@ -83,23 +84,14 @@ class UpdaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch desired release, send check-in, and expose computed integration state."""
-        try:
-            desired = await self._api.get_desired_release(
-                device_id=self._device_id,
-                device_token=self._device_token,
-            )
-        except Exception as err:
-            raise UpdateFailed(f"Unable to fetch desired release: {err}") from err
-
-        desired_version = desired.get("version")
-        status = "update_available" if desired_version and desired_version != self._installed_version else "up_to_date"
-        if not desired_version:
-            self.logger.debug("No desired release available yet for device %s", self._device_id)
-
+        """Send check-in and expose lockfile-driven update state."""
         try:
             metrics = self._collect_system_metrics()
-            await self._api.checkin(
+            config_dir = Path(self.hass.config.path())
+            module_lock = await self.hass.async_add_executor_job(
+                read_module_lock, config_dir
+            )
+            checkin_response = await self._api.checkin(
                 device_id=self._device_id,
                 device_token=self._device_token,
                 installed_version=self._installed_version,
@@ -109,7 +101,8 @@ class UpdaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 cpu_count=metrics["cpu_count"],
                 mem_total_mb=metrics["mem_total_mb"],
                 mem_available_mb=metrics["mem_available_mb"],
-                status=status,
+                status="checking",
+                module_lock=module_lock or None,
             )
             self.last_checkin = datetime.now(timezone.utc).isoformat()
         except Exception as err:
@@ -135,10 +128,16 @@ class UpdaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             self.logger.debug("Tunnel credentials sync skipped: %s", err)
 
+        update_available = bool(checkin_response.get("update_available"))
+        module_updates = checkin_response.get("module_updates")
+
         return {
             "device_id": self._device_id,
             "installed_version": self._installed_version,
-            "desired_release": desired,
-            "update_available": status == "update_available",
+            "update_available": update_available,
+            "artifact_url": checkin_response.get("artifact_url"),
+            "sha256": checkin_response.get("sha256"),
+            "module_lock": checkin_response.get("module_lock"),
+            "module_updates": module_updates,
             "last_checkin": self.last_checkin,
         }

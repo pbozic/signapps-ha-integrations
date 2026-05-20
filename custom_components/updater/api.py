@@ -39,24 +39,10 @@ class UpdaterApi:
             },
         )
 
-    async def get_desired_release(self, *, device_id: str, device_token: str) -> dict[str, Any]:
-        """Fetch target release metadata for the registered device."""
-        try:
-            return await self._request(
-                "GET",
-                f"/devices/{device_id}/desired-release",
-                token=device_token,
-            )
-        except RuntimeError as err:
-            # No release assigned yet should not break coordinator startup/polling.
-            if "No release available for this device" in str(err):
-                return {}
-            raise
-
     async def get_tunnel_credentials(
         self, *, device_id: str, device_token: str
     ) -> dict[str, Any] | None:
-        """Fetch tunnel hostname + JWT for SignApps Tunnel add-on. None if not provisioned (404)."""
+        """Fetch tunnel hostname + JWT for Signapps Tunnel add-on. None if not provisioned (404)."""
         try:
             return await self._request(
                 "GET",
@@ -82,22 +68,26 @@ class UpdaterApi:
         mem_total_mb: int | None,
         mem_available_mb: int | None,
         status: str,
+        module_lock: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Report current install/health status for the registered device."""
+        payload: dict[str, Any] = {
+            "installed_version": installed_version,
+            "ha_version": ha_version,
+            "uptime_seconds": uptime_seconds,
+            "load_1m": load_1m,
+            "cpu_count": cpu_count,
+            "mem_total_mb": mem_total_mb,
+            "mem_available_mb": mem_available_mb,
+            "status": status,
+        }
+        if module_lock:
+            payload["module_lock"] = module_lock
         return await self._request(
             "POST",
             f"/devices/{device_id}/checkin",
             token=device_token,
-            json={
-                "installed_version": installed_version,
-                "ha_version": ha_version,
-                "uptime_seconds": uptime_seconds,
-                "load_1m": load_1m,
-                "cpu_count": cpu_count,
-                "mem_total_mb": mem_total_mb,
-                "mem_available_mb": mem_available_mb,
-                "status": status,
-            },
+            json=payload,
         )
 
     async def _request(self, method: str, path: str, *, token: str, json: dict[str, Any] | None = None) -> dict[str, Any]:

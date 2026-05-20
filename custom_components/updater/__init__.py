@@ -147,13 +147,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if install_lock.locked():
             return
 
-        desired = (coordinator.data or {}).get("desired_release") or {}
-        desired_version = desired.get("version")
-        if not desired_version:
+        data = coordinator.data or {}
+        if not data.get("update_available"):
             return
-        if state.get("installed_version") == desired_version:
+        if not data.get("artifact_url"):
             return
-        if state.get("pending_version") == desired_version:
+        if state.get("pending_version"):
             return
 
         async with install_lock:
@@ -167,7 +166,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     entry=entry,
                 )
             except Exception as err:
-                _LOGGER.error("Auto install failed for version %s: %s", desired_version, err)
+                _LOGGER.error("Auto install failed: %s", err)
 
     def _schedule_auto_install() -> None:
         hass.async_create_task(_auto_install_if_needed())
@@ -231,7 +230,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await async_setup_signapps_panel(hass)
     except Exception as err:
-        _LOGGER.warning("SignApps panel registration skipped: %s", err)
+        _LOGGER.warning("Signapps panel registration skipped: %s", err)
 
     return True
 
