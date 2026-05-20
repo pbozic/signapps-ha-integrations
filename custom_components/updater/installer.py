@@ -48,33 +48,46 @@ def _extract_zip(zip_path: Path, target_dir: Path) -> None:
         archive.extractall(target_dir)
 
 
-def read_module_lock(config_dir: Path) -> dict[str, str]:
-    """Read the device's pinned module versions from updater state."""
-    manifest_path = config_dir / "updater" / "state" / "release-manifest.json"
+def _parse_lock_dict(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(module_name): str(version)
+        for module_name, version in raw.items()
+        if version
+    }
+
+
+def _module_lock_from_manifest_file(manifest_path: Path) -> dict[str, str]:
+    """Module versions recorded in the artifact (what this package installs)."""
     if not manifest_path.exists():
         return {}
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    module_lock = payload.get("module_lock")
-    if not isinstance(module_lock, dict):
+    if not isinstance(payload, dict):
         return {}
-    return {
-        str(module_name): str(version)
-        for module_name, version in module_lock.items()
-        if version
-    }
+    installed = _parse_lock_dict(payload.get("module_lock"))
+    if installed:
+        return installed
+    return _parse_lock_dict(payload.get("packaged_module_lock"))
+
+
+def read_module_lock(config_dir: Path) -> dict[str, str]:
+    """Read module_lock last installed on this device (used for update checks)."""
+    manifest_path = config_dir / "updater" / "state" / "release-manifest.json"
+    return _module_lock_from_manifest_file(manifest_path)
 
 
 def _sync_release_manifest(
     staging_dir: Path,
     config_dir: Path,
     *,
-    module_lock: dict[str, str] | None = None,
+    module_lock: dict[str, str],
     lock_hash: str | None = None,
 ) -> None:
-    """Persist release manifest (including module_lock) after each install."""
+    """Persist installed module_lock after a successful unpack."""
     target_dir = config_dir / "updater" / "state"
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / "release-manifest.json"
@@ -88,8 +101,12 @@ def _sync_release_manifest(
     else:
         payload = {}
 
-    if module_lock:
-        payload["module_lock"] = module_lock
+    if not isinstance(payload, dict):
+        payload = {}
+
+    payload["module_lock"] = module_lock
+    payload.pop("customer_module_lock", None)
+    payload.pop("packaged_module_lock", None)
     if lock_hash:
         payload["lock_hash"] = lock_hash
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -778,29 +795,32 @@ async def install_desired_release(
     state: dict[str, Any],
     store: Store[dict[str, Any]],
     entry: ConfigEntry,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Install the update artifact from the latest check-in response."""
-    data = coordinator.data or {}
+    """Install the update artifact from a check-in payload (or latest coordinator data)."""
+    data = payload if payload is not None else (coordinator.data or {})
     artifact_url = data.get("artifact_url")
-    module_lock = data.get("module_lock") or {}
     sha256 = data.get("sha256")
 
     if not artifact_url:
         raise RuntimeError("No update artifact available")
 
-    lock_hash = _compute_lock_hash(module_lock) if module_lock else None
-    version = (lock_hash or "update")[:12]
+    staging_version = "update"
 
-    backup_id = await _create_backup(hass, f"pre-updater-{entry.entry_id}-{version}")
+    backup_id = await _create_backup(
+        hass, f"pre-updater-{entry.entry_id}-{staging_version}"
+    )
 
     config_dir = Path(hass.config.path())
     updater_root = config_dir / "updater"
     releases_dir = updater_root / "releases"
-    staging_dir = updater_root / "staging" / version
-    zip_path = releases_dir / f"{version}.zip"
+    staging_dir = updater_root / "staging" / staging_version
+    zip_path = releases_dir / f"{staging_version}.zip"
     releases_dir.mkdir(parents=True, exist_ok=True)
 
+    _LOGGER.info("Downloading release artifact to %s", zip_path)
     await api.download_file(artifact_url=artifact_url, target_path=str(zip_path))
+    _LOGGER.info("Extracting release artifact into %s", staging_dir)
     await hass.async_add_executor_job(_extract_zip, zip_path, staging_dir)
 
     # Release package structure based on ha-plan.md:
@@ -810,15 +830,26 @@ async def install_desired_release(
     await hass.async_add_executor_job(_copy_tree, staging_dir / "packages", config_dir / "packages")
     await hass.async_add_executor_job(_copy_tree, staging_dir / "dashboard", config_dir / "dashboard")
     await hass.async_add_executor_job(_copy_tree, staging_dir / "www", config_dir / "www")
-    resolved_lock = module_lock if isinstance(module_lock, dict) else None
+
+    installed_lock = await hass.async_add_executor_job(
+        _module_lock_from_manifest_file,
+        staging_dir / "release-manifest.json",
+    )
+    if not installed_lock:
+        raise RuntimeError("Release package is missing module_lock in release-manifest.json")
+
+    lock_hash = _compute_lock_hash(installed_lock)
+    version = lock_hash[:12]
+
     await hass.async_add_executor_job(
         lambda: _sync_release_manifest(
             staging_dir,
             config_dir,
-            module_lock=resolved_lock,
+            module_lock=installed_lock,
             lock_hash=lock_hash,
         ),
     )
+    _LOGGER.info("Persisted installed module_lock (%d modules)", len(installed_lock))
 
     # Dashboard wiring phase: preset base + customer override -> generated dashboard + Lovelace wiring
     preset_key = "default"

@@ -143,20 +143,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     install_lock = asyncio.Lock()
 
-    async def _auto_install_if_needed() -> None:
+    async def _auto_install_from_checkin(payload: dict[str, Any]) -> None:
         if install_lock.locked():
+            _LOGGER.debug("Install already in progress; skipping")
             return
-
-        data = coordinator.data or {}
-        if not data.get("update_available"):
+        if not payload.get("update_available") or not payload.get("artifact_url"):
             return
-        if not data.get("artifact_url"):
-            return
-        if state.get("pending_version"):
+        if (
+            state.get("pending_version")
+            and state.get("last_update_status") == "pending_restart"
+        ):
+            _LOGGER.debug(
+                "Update %s already staged; waiting for restart",
+                state.get("pending_version"),
+            )
             return
 
         async with install_lock:
             try:
+                _LOGGER.info(
+                    "Starting auto-install (update available, artifact URL present)",
+                )
                 await install_desired_release(
                     hass,
                     api=api,
@@ -164,15 +171,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     state=state,
                     store=store,
                     entry=entry,
+                    payload=payload,
                 )
             except Exception as err:
                 _LOGGER.error("Auto install failed: %s", err)
 
-    def _schedule_auto_install() -> None:
-        hass.async_create_task(_auto_install_if_needed())
-
-    coordinator.async_add_listener(_schedule_auto_install)
-    _schedule_auto_install()
+    coordinator.async_set_install_callback(_auto_install_from_checkin)
 
     hass.data[DOMAIN][entry.entry_id] = {
         DATA_API: api,
@@ -195,6 +199,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 state=runtime[DATA_STATE],
                 store=runtime[DATA_STORE],
                 entry=runtime[DATA_ENTRY],
+                payload=None,
             )
 
         hass.services.async_register(

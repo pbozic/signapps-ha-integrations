@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 import logging
 import os
@@ -38,6 +39,13 @@ class UpdaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._device_token = device_token
         self._installed_version = installed_version
         self.last_checkin: str | None = None
+        self._install_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+
+    def async_set_install_callback(
+        self, callback: Callable[[dict[str, Any]], Awaitable[None]] | None
+    ) -> None:
+        """Register handler invoked when check-in reports an available update."""
+        self._install_callback = callback
 
     def _collect_system_metrics(self) -> dict[str, int | float | None]:
         """Collect best-effort system metrics from HA host."""
@@ -131,13 +139,22 @@ class UpdaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         update_available = bool(checkin_response.get("update_available"))
         module_updates = checkin_response.get("module_updates")
 
-        return {
+        result: dict[str, Any] = {
             "device_id": self._device_id,
             "installed_version": self._installed_version,
             "update_available": update_available,
             "artifact_url": checkin_response.get("artifact_url"),
             "sha256": checkin_response.get("sha256"),
-            "module_lock": checkin_response.get("module_lock"),
+            "desired_module_lock": checkin_response.get("desired_module_lock"),
             "module_updates": module_updates,
             "last_checkin": self.last_checkin,
         }
+
+        if (
+            update_available
+            and result.get("artifact_url")
+            and self._install_callback is not None
+        ):
+            self.hass.async_create_task(self._install_callback(dict(result)))
+
+        return result
